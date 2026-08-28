@@ -304,6 +304,7 @@ pub(crate) struct LogFetchOrchestrator {
     has_backfill: bool,
     resolved_attached_functions: Option<Vec<AttachedFunction>>,
     attached_function_id_filter: Option<AttachedFunctionUuid>,
+    materialization_visibility_cutoff: Option<i64>,
 }
 
 #[async_trait]
@@ -437,6 +438,7 @@ impl LogFetchOrchestrator {
             has_backfill: false,
             resolved_attached_functions: None,
             attached_function_id_filter,
+            materialization_visibility_cutoff: None,
         }
     }
 
@@ -547,7 +549,8 @@ impl LogFetchOrchestrator {
                 record_reader.clone(),
                 next_max_offset_ids.clone(),
                 option,
-            );
+            )
+            .with_visibility_cutoff(self.materialization_visibility_cutoff);
             let task = wrap(
                 operator,
                 input,
@@ -619,6 +622,7 @@ impl Handler<TaskResult<GetCollectionAndSegmentsOutput, GetCollectionAndSegments
         let mut record_segment_for_reader = output.record_segment.clone();
         let mut pulled_log_offset = collection.log_position;
         let mut log_upper_bound_offset = None;
+        let mut maximum_fetch_count = self.context.max_compaction_size as u32;
 
         // Compacted-state backfill reads the whole live segment and is not
         // constrained by the incremental max_compaction_size window.
@@ -656,8 +660,6 @@ impl Handler<TaskResult<GetCollectionAndSegmentsOutput, GetCollectionAndSegments
                     }
                 },
             };
-            self.context.log_start_offset = Some(completion_offset);
-
             let max_compaction_size = self.context.max_compaction_size;
             let blockfile_provider = self.context.blockfile_provider.clone();
             let boundary_plan = match LogFetchOrchestrator::get_async_fn_fetch_boundaries(
@@ -679,6 +681,7 @@ impl Handler<TaskResult<GetCollectionAndSegmentsOutput, GetCollectionAndSegments
             tracing::info!(
                 collection_id = %collection.collection_id,
                 completion_offset,
+                snapshot_log_position = boundary_plan.snapshot_log_position,
                 target_log_position = boundary_plan.target_log_position,
                 uses_pre_compaction_state = boundary_plan.historical_record_segment.is_none(),
                 "Resolved async function execution boundary"
@@ -686,8 +689,25 @@ impl Handler<TaskResult<GetCollectionAndSegmentsOutput, GetCollectionAndSegments
 
             record_segment_for_reader =
                 boundary_plan.record_segment_for_reader(&output.record_segment);
+            self.context.log_start_offset = Some(boundary_plan.snapshot_log_position);
+            self.materialization_visibility_cutoff = Some(completion_offset);
             pulled_log_offset = boundary_plan.target_log_position;
             log_upper_bound_offset = Some((boundary_plan.target_log_position + 1) as u64);
+            maximum_fetch_count = match u32::try_from(
+                boundary_plan.target_log_position - boundary_plan.snapshot_log_position,
+            ) {
+                Ok(count) => count,
+                Err(_) => {
+                    self.terminate_with_result(
+                        Err(LogFetchOrchestratorError::InvariantViolation(
+                            "fn-consumer replay window does not fit in u32",
+                        )),
+                        ctx,
+                    )
+                    .await;
+                    return;
+                }
+            };
         }
 
         // Create RecordSegmentReader for MaterializeLogOperator
@@ -797,7 +817,7 @@ impl Handler<TaskResult<GetCollectionAndSegmentsOutput, GetCollectionAndSegments
                         Some(offset) => u64::try_from(offset + 1).unwrap_or_default(),
                         None => u64::try_from(collection.log_position + 1).unwrap_or_default(),
                     },
-                    maximum_fetch_count: Some(self.context.max_compaction_size as u32),
+                    maximum_fetch_count: Some(maximum_fetch_count),
                     collection_uuid: collection.collection_id,
                     tenant: collection.tenant.clone(),
                     database_name,

@@ -4992,7 +4992,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_k8s_integration_async_attached_function() {
+    async fn test_async_attached_function_boundaries() {
         // Setup test environment
         let config = RootConfig::default();
         let system = System::default();
@@ -5209,6 +5209,59 @@ mod tests {
         }
 
         Box::pin(fn_consumer_context.cleanup()).await;
+
+        // An unaligned function checkpoint must replay from the prior
+        // collection snapshot while hiding records already covered by the
+        // function. The snapshot is at 99, but only (149, 299] is visible.
+        let mut unaligned_context = CompactionContext::new_with_log_offset(
+            None,
+            50,
+            10,
+            1000,
+            50,
+            log.clone(),
+            sysdb.clone(),
+            test_segments.blockfile_provider.clone(),
+            test_segments.hnsw_provider.clone(),
+            test_segments.spann_provider.clone(),
+            dispatcher_handle.clone(),
+            false,
+            true,
+            None,
+            None,
+            None,
+            None,
+            149,
+        );
+
+        let unaligned_response = unaligned_context
+            .run_get_logs(
+                collection_id,
+                database_name.clone(),
+                system.clone(),
+                false,
+                None,
+            )
+            .await
+            .expect("unaligned fn-consumer log fetch should succeed");
+
+        match unaligned_response {
+            LogFetchOrchestratorResponse::Success(success) => {
+                assert_eq!(success.collection_info.pulled_log_offset, 299);
+                let total_materialized_records: usize = success
+                    .materialized
+                    .iter()
+                    .map(|batch| batch.result.len())
+                    .sum();
+                assert_eq!(
+                    total_materialized_records, 150,
+                    "records at or below the function checkpoint must only rebuild state"
+                );
+            }
+            other => panic!("expected successful unaligned fetch, got {other:?}"),
+        }
+
+        Box::pin(unaligned_context.cleanup()).await;
 
         // Repeat from the first boundary with a max_compaction_size of exactly
         // one window (100) to prove the cap forces the fetch back to the

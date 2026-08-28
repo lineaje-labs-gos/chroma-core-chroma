@@ -4,6 +4,7 @@ use chroma_types::Segment;
 #[derive(Debug, Clone)]
 pub(crate) struct AsyncFnBoundaryPlan {
     pub(crate) historical_record_segment: Option<Segment>,
+    pub(crate) snapshot_log_position: i64,
     pub(crate) target_log_position: i64,
 }
 
@@ -77,13 +78,11 @@ pub(crate) fn resolve_boundary_plan_from_version_file(
         next_boundary = Some(log_position);
     }
 
+    let snapshot_log_position = historical_version
+        .as_ref()
+        .map(|(_, log_position)| *log_position)
+        .unwrap_or_else(|| completion_offset.min(0));
     let historical_record_segment = match historical_version {
-        Some((_, log_position)) if completion_offset > 0 && log_position < completion_offset => {
-            return Err(format!(
-                "Invariant violation: async fn completion offset {} does not align to a compaction boundary",
-                completion_offset
-            ));
-        }
         Some((version, _)) => Some(
             live_record_segment.historical_segment_for_version(version, live_record_segment.id)?,
         ),
@@ -118,6 +117,7 @@ pub(crate) fn resolve_boundary_plan_from_version_file(
 
     Ok(AsyncFnBoundaryPlan {
         historical_record_segment,
+        snapshot_log_position,
         target_log_position,
     })
 }
@@ -203,6 +203,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(plan.snapshot_log_position, 100);
         assert_eq!(plan.target_log_position, 150);
         assert_eq!(
             plan.historical_record_segment.unwrap().file_path["offset_id_to_data"],
@@ -228,6 +229,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(plan.target_log_position, 150);
+        assert_eq!(plan.snapshot_log_position, 0);
         assert!(
             plan.historical_record_segment.is_none(),
             "completion offset zero should use the empty pre-compaction state"
@@ -344,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_boundary_completion_offsets_after_first_compaction() {
+    fn resolves_non_boundary_completion_from_prior_snapshot() {
         let record_segment = test_record_segment();
         let version_file = CollectionVersionFile {
             version_history: Some(CollectionVersionHistory {
@@ -356,15 +358,20 @@ mod tests {
             ..Default::default()
         };
 
-        let err = resolve_boundary_plan_from_version_file(
+        let plan = resolve_boundary_plan_from_version_file(
             Some(&version_file),
             125,
             1024,
             &record_segment,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err.contains("does not align to a compaction boundary"));
+        assert_eq!(plan.snapshot_log_position, 100);
+        assert_eq!(plan.target_log_position, 150);
+        assert_eq!(
+            plan.historical_record_segment.unwrap().file_path["offset_id_to_data"],
+            vec!["record/v100".to_string()]
+        );
     }
 
     #[test]
@@ -400,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_completion_offsets_that_only_match_deleted_versions() {
+    fn replays_from_live_snapshot_when_completion_boundary_was_deleted() {
         let record_segment = test_record_segment();
         let mut deleted_version = version_info(2, 150, record_segment.id, "record/v150");
         deleted_version.marked_for_deletion = true;
@@ -416,15 +423,15 @@ mod tests {
             ..Default::default()
         };
 
-        let err = resolve_boundary_plan_from_version_file(
+        let plan = resolve_boundary_plan_from_version_file(
             Some(&version_file),
             150,
             1024,
             &record_segment,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err.contains("Invariant violation"));
-        assert!(err.contains("does not align to a compaction boundary"));
+        assert_eq!(plan.snapshot_log_position, 100);
+        assert_eq!(plan.target_log_position, 200);
     }
 }
